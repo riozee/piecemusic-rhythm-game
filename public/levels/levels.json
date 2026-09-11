@@ -1,0 +1,30 @@
+[
+  {
+    "id": "____",
+    "name": "逆転",
+    "artist": "",
+    "archiveUrl": "https://data.piecemusic.party/%E9%80%86%E8%BB%A2-144p.zip",
+    "levelCount": 1,
+    "levels": [
+      {
+        "id": "standard",
+        "name": "Standard",
+        "difficulty": 5
+      }
+    ]
+  },
+  {
+    "id": "____",
+    "name": "逆転",
+    "artist": "",
+    "archiveUrl": "https://data.piecemusic.party/%E9%80%86%E8%BB%A2.zip",
+    "levelCount": 1,
+    "levels": [
+      {
+        "id": "standard",
+        "name": "Standard",
+        "difficulty": 5
+      }
+    ]
+  }
+]

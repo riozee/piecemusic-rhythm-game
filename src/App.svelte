@@ -1,563 +1,956 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import QRCode from 'qrcode';
+  import { MasterSlaveSyncEngine } from './core/sync-engine';
+  import { ViewportManager, type ViewportLayout } from './core/viewport';
+  import { revokeMediaBlob } from './core/media-loader';
+  import { WebRtcHost, generateRoomId, type ControllerKeyEvent, type ControllerCommand, type ControllerState } from './core/webrtc';
+  import type { SyncState } from './types/level';
+  import type { TrackData } from './types/track';
+  import type { SongData, SongLevel, SongListItem } from './types/song';
+  import { getAvailableSongs, loadSong } from './core/song-loader';
+  import { createDefaultSong, packSongArchive, unpackSongArchive, downloadBlob } from './core/song-archive';
+  import { deleteStoredSong } from './core/song-storage';
+  import { createDefaultTrack } from './core/levels';
+  import HomeScreen from './components/HomeScreen.svelte';
+  import SongSelect from './components/SongSelect.svelte';
+  import LevelSelect from './components/LevelSelect.svelte';
+  import EditScreen from './components/EditScreen.svelte';
+  import PauseOverlay from './components/PauseOverlay.svelte';
+  import StageClearOverlay from './components/StageClearOverlay.svelte';
+  import PaperSvgFilters from './components/PaperSvgFilters.svelte';
+  import RhythmPlayCanvas from './components/RhythmPlayCanvas.svelte';
+  import PhoneController from './components/PhoneController.svelte';
 
-  const BASE_NOTE_TRAVEL_TIME = 2000;
-  const BASE_HIT_WINDOW_START = 900;
-  const BASE_HIT_WINDOW_END = 1500;
-  const HIT_TOLERANCE_DEG = 45;
-  const NETWORK_THROTTLE_MS = 16;
+  // Check if current URL is for the phone controller screen
+  const urlParams = new URLSearchParams(window.location.search);
+  const isControllerMode =
+    urlParams.get('mode') === 'controller' ||
+    window.location.pathname.startsWith('/controller');
+  const controllerInitialRoom = urlParams.get('room') || '';
 
-  type Note = {
-    id: string;
-    side: 'LEFT' | 'RIGHT';
-    angle: number;
-    createdAt: number;
-    type: 'SINGLE' | 'DOUBLE';
-    missed?: boolean;
-    travelTime: number;
-    hitStart: number;
-    hitEnd: number;
-  };
+  type Screen = 'home' | 'song-select' | 'level-select' | 'edit' | 'playing';
 
-  type HitFeedback = {
-    id: string;
-    angle: number;
-  };
+  let currentScreen = $state<Screen>('home');
+  let isPaused = $state<boolean>(false);
+  let isAwaitingAudioStart = $state<boolean>(false);
+  // True when the current gameplay session was launched from the chart editor,
+  // so quitting returns to the editor instead of level selection.
+  let launchedFromEditor = false;
 
-  let urlRoom = $state<string | null>(null);
-  let isDevMode = $state(false);
-  let isAutoMode = $state(false);
-
-  let role = $state<'loading' | 'desktop' | 'phone'>('loading');
-  let status = $state('初期化中 ⏳');
-  let qrUrl = $state('');
-  let qrDataUrl = $state('');
-
-  let isConnected = $state(false);
-  let isPlaying = $state(false);
-
-  let playerState = $state({ left: false, right: false });
-  let notes = $state<Note[]>([]);
-  let hits = $state<HitFeedback[]>([]);
-  let score = $state(0);
-  let combo = $state(0);
-
-  let steeringContainerRef = $state<HTMLDivElement | null>(null);
-
-  // Engine state variables
-  let speedMultiplier = 1.0;
-  let sendAction: any = null;
-  let hostPeerId: string | null = null;
-  let activePlayerId: string | null = null;
-  let prevAngle = { LEFT: 180, RIGHT: 0 };
-
-  // Autopilot Smoothing Refs
-  let targetTilt = 0;
-  let currentTilt = 0;
-
-  let phoneState = { left: false, right: false, tilt: 0 };
-  let lastSendTime = 0;
-  let lastSentTilt = 0;
-  let sensorsStarted = false;
-
-  onMount(() => {
-    const searchParams = new URLSearchParams(window.location.search);
-    urlRoom = searchParams.get('room');
-    isDevMode = searchParams.get('dev') === 'true';
-    isAutoMode = searchParams.get('auto') === 'true';
-
-    if (isDevMode || isAutoMode) {
-      role = 'desktop';
-      status = isAutoMode ? 'AUTOPILOT ENGAGED 🚀' : 'デベロッパーモード 🔥';
-      isConnected = true;
-      isPlaying = true;
+  // Song & Level selection state
+  let songSelectMode = $state<'play' | 'manage'>('play');
+  let availableSongs = $state<SongListItem[]>([]);
+  let displayedSongs = $derived.by(() =>
+    songSelectMode === 'manage'
+      ? availableSongs.filter((s) => s.source !== 'server')
+      : availableSongs
+  );
+  let remoteSongCursor = $state(0);
+  let remoteLevelCursor = $state(0);
+  let activeSong = $state<SongData>(createDefaultSong('逆転'));
+  // svelte-ignore state_referenced_locally
+  let activeLevel = $state<SongLevel>(
+    activeSong.levels[0] || {
+      id: 'standard',
+      name: '標準',
+      difficulty: 5.0,
+      trackData: createDefaultTrack(),
     }
+  );
+  // svelte-ignore state_referenced_locally
+  let activeTrackData = $state<TrackData>(activeLevel.trackData || createDefaultTrack());
+  let errorMessage = $state<string | null>(null);
+
+  // Loading state
+  let isLoadingSong = $state<boolean>(false);
+  let songLoadingProgress = $state<number>(0);
+
+  // In-Game score & completion tracking
+  let currentGameScore = $state(0);
+  let currentGameCombo = $state(0);
+  let rhythmCanvas = $state<RhythmPlayCanvas | null>(null);
+  let isGameFinished = $state(false);
+  let finalGameStats = $state<{
+    score: number;
+    maxCombo: number;
+    totalNotes: number;
+    hitNotes: number;
+  } | null>(null);
+
+  // Native Chart Duration & Independent Game Elapsed Time
+  let chartDuration = $state(0);
+  let gameElapsedSec = $state(0);
+  let overtimeAnimId: number | null = null;
+  let lastOvertimeTick = 0;
+
+  // WebRTC Phone Controller Pairing State
+  let roomId = $state<string>('');
+  let controllerUrl = $state<string>('');
+  let qrDataUrl = $state<string>('');
+  let connectedPeersCount = $state<number>(0);
+  let lastReceivedKey = $state<string | null>(null);
+  // `$state.raw` keeps reassignment reactive without deep-proxying the trystero
+  // host instance (which would break its internal action objects).
+  let webrtcHost = $state.raw<WebRtcHost | null>(null);
+
+  // Media blob URLs
+  let audioBlobUrl = $state<string | null>(null);
+  let videoBlobUrl = $state<string | null>(null);
+
+  // Master/slave sync status
+  let syncCurrentTime = $state<number>(0);
+  let syncDuration = $state<number>(0);
+  let syncIsPlaying = $state<boolean>(false);
+
+  let audioElement = $state<HTMLAudioElement | null>(null);
+  let videoElement = $state<HTMLVideoElement | null>(null);
+
+  // Video finishing condition: if chart is longer than video, video fades to black
+  let isVideoFinished = $derived(
+    videoElement && !isNaN(videoElement.duration) && videoElement.duration > 0
+      ? gameElapsedSec >= videoElement.duration
+      : false
+  );
+
+  const syncEngine = new MasterSlaveSyncEngine();
+  let viewportManager: ViewportManager | null = null;
+  let unsubscribeSync: (() => void) | null = null;
+
+  let layout = $state<ViewportLayout>({
+    isPortrait: false,
+    containerWidth: 0,
+    containerHeight: 0,
+    transform: 'none',
+    transformOrigin: '0 0',
+    physicalWidth: 0,
+    physicalHeight: 0,
   });
 
-  // --- Speed Escalation Engine ---
-  $effect(() => {
-    if (!isPlaying || role !== 'desktop') return;
+  function startOvertimeLoop() {
+    if (overtimeAnimId !== null) return;
+    lastOvertimeTick = performance.now();
 
-    const speedScaler = setInterval(() => {
-      speedMultiplier *= 1.005;
-    }, 1000);
-
-    return () => clearInterval(speedScaler);
-  });
-
-  // --- Auto-Pilot AI Engine (Smooth) ---
-  $effect(() => {
-    if (!isAutoMode || role !== 'desktop' || !isPlaying) return;
-
-    let animationFrameId: number;
-
-    const renderLoop = () => {
-      currentTilt += (targetTilt - currentTilt) * 0.15;
-      if (steeringContainerRef) {
-        steeringContainerRef.style.transform = `rotate(${currentTilt}deg)`;
+    const loop = (now: number) => {
+      if (currentScreen !== 'playing' || isPaused || isGameFinished) {
+        overtimeAnimId = null;
+        return;
       }
-      animationFrameId = requestAnimationFrame(renderLoop);
-    };
-    renderLoop();
-
-    const autopilotEngine = setInterval(() => {
-      const now = Date.now();
-
-      const pendingHits = notes.filter(n => {
-        if (n.missed) return false;
-        const age = now - n.createdAt;
-        const optimalHitTime = n.hitStart + ((n.hitEnd - n.hitStart) * 0.25) + (Math.random() * 20 - 10);
-        return age >= optimalHitTime && age <= optimalHitTime + 60;
-      });
-
-      const upcomingNotes = notes.filter(n => !n.missed).sort((a, b) => a.createdAt - b.createdAt);
-      if (upcomingNotes.length > 0) {
-        const baseNote = upcomingNotes[0];
-        const angleDrift = Math.random() * 4 - 2;
-        targetTilt = (baseNote.side === 'RIGHT' ? baseNote.angle : baseNote.angle - 180) + angleDrift;
-      } else {
-        targetTilt = 0;
+      const dt = (now - lastOvertimeTick) / 1000;
+      lastOvertimeTick = now;
+      if (dt > 0 && dt < 0.2) {
+        gameElapsedSec += dt;
       }
-
-      if (pendingHits.length > 0) {
-        const activeTaps = pendingHits.map(n => n.side);
-
-        playerState = {
-          left: activeTaps.includes('LEFT'),
-          right: activeTaps.includes('RIGHT')
-        };
-
-        setTimeout(() => {
-          playerState = { left: false, right: false };
-        }, 60);
-
-        handleTaps(activeTaps, currentTilt);
-      }
-    }, 30);
-
-    return () => {
-      clearInterval(autopilotEngine);
-      cancelAnimationFrame(animationFrameId);
-    };
-  });
-
-  // --- Desktop Game Loop ---
-  $effect(() => {
-    if (role !== 'desktop' || !isConnected || !isPlaying) return;
-
-    let spawnerTimeout: ReturnType<typeof setTimeout>;
-
-    const spawnNote = () => {
-      const roll = Math.random();
-      const now = Date.now();
-      const speed = speedMultiplier;
-      const newNotes: Note[] = [];
-
-      const currentTravelTime = BASE_NOTE_TRAVEL_TIME / speed;
-      const currentHitStart = BASE_HIT_WINDOW_START / speed;
-      const currentHitEnd = BASE_HIT_WINDOW_END / speed;
-
-      const getNextAngle = (side: 'LEFT' | 'RIGHT') => {
-        const variance = (Math.random() * 40) - 20;
-        let base = prevAngle[side] + variance;
-        if (side === 'RIGHT') base = Math.max(-45, Math.min(45, base));
-        if (side === 'LEFT') base = Math.max(135, Math.min(225, base));
-        prevAngle[side] = base;
-        return base;
-      };
-
-      if (roll < 0.25) {
-        const rightAngle = getNextAngle('RIGHT');
-        newNotes.push({ id: `R-${now}`, side: 'RIGHT', angle: rightAngle, createdAt: now, type: 'DOUBLE', travelTime: currentTravelTime, hitStart: currentHitStart, hitEnd: currentHitEnd });
-        newNotes.push({ id: `L-${now}`, side: 'LEFT', angle: rightAngle + 180, createdAt: now, type: 'DOUBLE', travelTime: currentTravelTime, hitStart: currentHitStart, hitEnd: currentHitEnd });
-      } else if (roll < 0.75) {
-        const side = Math.random() > 0.5 ? 'LEFT' : 'RIGHT';
-        newNotes.push({ id: `${side[0]}-${now}`, side, angle: getNextAngle(side), createdAt: now, type: 'SINGLE', travelTime: currentTravelTime, hitStart: currentHitStart, hitEnd: currentHitEnd });
-      }
-
-      if (newNotes.length > 0) notes = [...notes, ...newNotes];
-
-      const nextSpawnInterval = 1000 / speedMultiplier;
-      spawnerTimeout = setTimeout(spawnNote, nextSpawnInterval);
+      overtimeAnimId = requestAnimationFrame(loop);
     };
 
-    spawnerTimeout = setTimeout(spawnNote, 1000);
-
-    const cleanup = setInterval(() => {
-      const now = Date.now();
-      let dropped = false;
-      const next = notes.map(n => {
-        if (!n.missed && now - n.createdAt > n.hitEnd) {
-          dropped = true;
-          return { ...n, missed: true };
-        }
-        return n;
-      }).filter(n => now - n.createdAt < n.travelTime + 200);
-
-      if (dropped) setTimeout(() => { combo = 0; }, 0);
-      notes = next;
-    }, 100);
-
-    return () => {
-      clearTimeout(spawnerTimeout);
-      clearInterval(cleanup);
-    };
-  });
-
-  // --- Network Initialization ---
-  $effect(() => {
-    if (isDevMode || isAutoMode || role === 'loading') return;
-
-    let currentRoom: any = null;
-
-    const initializeTrystero = async () => {
-      const { joinRoom } = await import('@trystero-p2p/mqtt');
-      const isHost = !urlRoom;
-      const roomId = urlRoom || 'game_' + Math.random().toString(36).substring(2, 9);
-
-      const config = {
-        appId: 'my-campus-racer-v4',
-        rtcConfig: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-      };
-
-      currentRoom = joinRoom(config, roomId);
-      const controllerAction = currentRoom.makeAction('controller');
-
-      if (isHost) {
-        role = 'desktop';
-        const generatedQrUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
-        qrUrl = generatedQrUrl;
-        try {
-          qrDataUrl = await QRCode.toDataURL(generatedQrUrl, { width: 300, margin: 2, color: { dark: '#000000', light: '#ffffff' } });
-        } catch (err) {
-          console.error('Failed to generate QR code', err);
-        }
-        status = 'コントローラーの接続を待機中 🎧';
-
-        currentRoom.onPeerJoin = (peerId: string) => {
-          if (!activePlayerId) {
-            activePlayerId = peerId;
-            status = 'コントローラーが接続されました。開始を待っています 💿';
-            isConnected = true;
-          }
-        };
-
-        currentRoom.onPeerLeave = (peerId: string) => {
-          if (activePlayerId === peerId) {
-            activePlayerId = null;
-            isConnected = false;
-            isPlaying = false;
-            status = '信号が途絶えました。再スキャンして接続してください 📡';
-            playerState = { left: false, right: false };
-            notes = [];
-            speedMultiplier = 1.0;
-          }
-        };
-
-        controllerAction.onMessage = (payload: any, { peerId }: any) => {
-          if (!activePlayerId) {
-            activePlayerId = peerId;
-            isConnected = true;
-          }
-          if (peerId !== activePlayerId) return;
-
-          if (payload.action === 'START') {
-            status = 'ゲームスタート 🔥';
-            isPlaying = true;
-            return;
-          }
-
-          if (steeringContainerRef) {
-            steeringContainerRef.style.transform = `rotate(${payload.tilt}deg)`;
-          }
-
-          if (playerState.left !== payload.left || playerState.right !== payload.right) {
-            playerState = { left: payload.left, right: payload.right };
-          }
-
-          if (payload.taps && payload.taps.length > 0) handleTaps(payload.taps, payload.tilt);
-        };
-
-      } else {
-        role = 'phone';
-        status = '画面にペアリング中 🔗';
-        sendAction = controllerAction;
-
-        currentRoom.onPeerJoin = (peerId: string) => {
-          hostPeerId = peerId;
-          status = '準備完了 🔥';
-        };
-      }
-    };
-
-    initializeTrystero();
-    return () => { if (currentRoom) currentRoom.leave(); };
-  });
-
-  function handleTaps(taps: string[], currentTilt: number) {
-    const now = Date.now();
-    let notesToKeep = [...notes];
-    let hitRegistered = false;
-    const newHits: HitFeedback[] = [];
-
-    taps.forEach(tapSide => {
-      const targetNoteIndex = notesToKeep.findIndex(n => {
-        const age = now - n.createdAt;
-        return n.side === tapSide && !n.missed && age >= n.hitStart && age <= n.hitEnd;
-      });
-
-      if (targetNoteIndex !== -1) {
-        const note = notesToKeep[targetNoteIndex];
-        const expectedAngle = note.side === 'LEFT' ? currentTilt + 180 : currentTilt;
-        const angleDiff = Math.abs(((note.angle - expectedAngle + 540) % 360) - 180);
-
-        if (angleDiff <= HIT_TOLERANCE_DEG) {
-          notesToKeep.splice(targetNoteIndex, 1);
-          hitRegistered = true;
-
-          const speedBonus = Math.floor((speedMultiplier - 1) * 500);
-          score += 100 + speedBonus;
-
-          const uniqueSuffix = Math.random().toString(36).substring(2, 6);
-          const hitId = `${now}-${tapSide}-${uniqueSuffix}`;
-
-          newHits.push({ id: hitId, angle: note.angle });
-          setTimeout(() => {
-            hits = hits.filter(x => x.id !== hitId);
-          }, 300);
-        }
-      }
-    });
-
-    if (hitRegistered) combo += 1;
-    else if (taps.length > 0) combo = 0;
-
-    if (newHits.length > 0) hits = [...hits, ...newHits];
-    notes = notesToKeep;
+    overtimeAnimId = requestAnimationFrame(loop);
   }
 
-  async function requestSensors() {
-    if (sensorsStarted) return;
+  function stopOvertimeLoop() {
+    if (overtimeAnimId !== null) {
+      cancelAnimationFrame(overtimeAnimId);
+      overtimeAnimId = null;
+    }
+  }
+
+  async function refreshSongList() {
+    try {
+      availableSongs = await getAvailableSongs();
+    } catch (e) {
+      console.warn('[App] Failed to refresh songs list:', e);
+    }
+  }
+
+  onMount(async () => {
+    if (isControllerMode) return;
 
     try {
-      if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
-      const screenOrientation = window.screen?.orientation as any;
-      if (screenOrientation && typeof screenOrientation.lock === 'function') {
-        await screenOrientation.lock('landscape');
-      }
-    } catch (e) { console.warn('ネイティブ画面方向ロックがスキップされました', e); }
+      viewportManager = new ViewportManager();
+      viewportManager.subscribe((newLayout: ViewportLayout) => {
+        layout = newLayout;
+      });
 
-    if (typeof (DeviceOrientationEvent as any)?.requestPermission === 'function') {
-      try {
-        const permission = await (DeviceOrientationEvent as any).requestPermission();
-        if (permission !== 'granted') return alert('プレイするにはモーションセンサーへのアクセス許可が必要です 🛑');
-      } catch (e) { console.error(e); }
-    }
+      unsubscribeSync = syncEngine.onSyncState((state: SyncState) => {
+        syncCurrentTime = state.currentTime;
+        syncDuration = state.duration;
+        syncIsPlaying = state.isPlaying;
 
-    sensorsStarted = true;
-    if (sendAction && hostPeerId) {
-      sendAction.send({ action: 'START' }, { target: hostPeerId });
-    }
-
-    window.addEventListener('deviceorientation', (e) => {
-      if (!sendAction || !hostPeerId) return;
-
-      const now = Date.now();
-      const isNativePortrait = window.innerHeight > window.innerWidth;
-      let currentTilt = isNativePortrait ? -(e.beta || 0) : (((window.screen?.orientation as any)?.angle || window.orientation || 0) === 90 ? (e.beta || 0) : -(e.beta || 0));
-
-      const rawTilt = Math.max(-90, Math.min(90, currentTilt));
-      const clampedTilt = Math.round(rawTilt * 10) / 10;
-
-      phoneState.tilt = clampedTilt;
-
-      if (now - lastSendTime >= NETWORK_THROTTLE_MS) {
-        if (clampedTilt !== lastSentTilt) {
-          lastSendTime = now;
-          lastSentTilt = clampedTilt;
-
-          sendAction.send({
-            left: phoneState.left,
-            right: phoneState.right,
-            tilt: clampedTilt,
-            taps: []
-          }, { target: hostPeerId });
+        // While master audio is actively playing, drive gameElapsedSec from audio clock
+        if (state.isPlaying || (syncDuration > 0 && state.currentTime < syncDuration - 0.1)) {
+          gameElapsedSec = state.currentTime;
+          stopOvertimeLoop();
+        } else if (
+          currentScreen === 'playing' &&
+          !isPaused &&
+          !isGameFinished &&
+          chartDuration > syncDuration
+        ) {
+          // If chart is longer than audio, continue advancing game time in overtime loop
+          startOvertimeLoop();
         }
+      });
+
+      // 1. Initialize WebRTC Host & Room ID
+      let storedRoom = sessionStorage.getItem('piecemusic_room_id');
+      if (!storedRoom) {
+        storedRoom = generateRoomId();
+        sessionStorage.setItem('piecemusic_room_id', storedRoom);
       }
+      roomId = storedRoom;
+
+      // 2. Discover LAN host IP if running on localhost dev server
+      let host = window.location.host;
+      try {
+        const res = await fetch('/api/host-info');
+        if (res.ok) {
+          const info = await res.json();
+          if (
+            info.lanIp &&
+            (window.location.hostname === 'localhost' ||
+              window.location.hostname === '127.0.0.1')
+          ) {
+            host = `${info.lanIp}:${window.location.port}`;
+          }
+        }
+      } catch {}
+
+      controllerUrl = `${window.location.protocol}//${host}/?mode=controller&room=${roomId}`;
+
+      // 3. Generate Sharp Paper styled QR Code
+      qrDataUrl = await QRCode.toDataURL(controllerUrl, {
+        errorCorrectionLevel: 'M',
+        margin: 2,
+        color: {
+          dark: '#292524',
+          light: '#fffdfa',
+        },
+        width: 240,
+      });
+
+      // 4. Start WebRTC Host listening on public MQTT beacon
+      webrtcHost = new WebRtcHost(roomId, {
+        onPeerJoin: (peerId: string) => {
+          console.log('[WebRTC] Controller phone connected:', peerId);
+          connectedPeersCount = webrtcHost?.getConnectedPeerCount() || 1;
+          broadcastControllerState();
+        },
+        onPeerLeave: (peerId: string) => {
+          console.log('[WebRTC] Controller phone disconnected:', peerId);
+          connectedPeersCount = webrtcHost?.getConnectedPeerCount() || 0;
+        },
+        onKeyMessage: (event: ControllerKeyEvent) => {
+          lastReceivedKey = `${event.key} [${event.action.toUpperCase()}]`;
+
+          // Process key event in rhythm game when in playing mode.
+          // Latency compensation: map the phone's press timestamp into host audio
+          // time so the note is judged at the moment it was pressed — not when the
+          // WebRTC packet happened to arrive.
+          if (currentScreen === 'playing' && event.action === 'down' && !isGameFinished) {
+            const offsetMs = webrtcHost?.getClockOffsetMs() ?? 0;
+            const hostPerfNow = event.timestamp - offsetMs;
+            const pressAudioTime = syncEngine.hostClockToAudioTime(hostPerfNow);
+            rhythmCanvas?.handleRhythmInput(event.key, pressAudioTime);
+          }
+        },
+        onCommandMessage: (event) => {
+          handleControllerCommand(event.command, event.id);
+        },
+      });
+      webrtcHost.start();
+
+      // 5. Discover songs (index only — no archive is downloaded here).
+      //    A song is loaded lazily when the user selects it.
+      await refreshSongList();
+    } catch (err: any) {
+      console.error('Failed to initialize game barebone:', err);
+      errorMessage = err?.message || '初期化エラー';
+    }
+  });
+
+  $effect(() => {
+    if (audioElement) {
+      syncEngine.attach(audioElement, videoElement);
+    }
+  });
+
+  function buildControllerState(): ControllerState {
+    return {
+      screen: currentScreen,
+      songSelectMode: songSelectMode,
+      isPaused: isPaused,
+      isGameFinished: isGameFinished,
+    };
+  }
+
+  function broadcastControllerState() {
+    webrtcHost?.sendState(buildControllerState());
+  }
+
+  // Broadcast the desktop's current screen/context to connected phones so the
+  // remote controller can render context-sensitive controls.
+  $effect(() => {
+    if (webrtcHost) {
+      broadcastControllerState();
+    }
+  });
+
+  // Keep the remote cursor in bounds and reset it when leaving a selection screen.
+  $effect(() => {
+    if (currentScreen !== 'song-select') {
+      remoteSongCursor = 0;
+    } else if (remoteSongCursor >= displayedSongs.length) {
+      remoteSongCursor = 0;
+    }
+
+    const levelCount = activeSong?.levels?.length || 0;
+    if (currentScreen !== 'level-select') {
+      remoteLevelCursor = 0;
+    } else if (remoteLevelCursor >= levelCount) {
+      remoteLevelCursor = 0;
+    }
+  });
+
+  // Navigation handlers
+  function toPlaySongSelect() {
+    songSelectMode = 'play';
+    refreshSongList();
+    currentScreen = 'song-select';
+  }
+
+  function toManageSongSelect() {
+    songSelectMode = 'manage';
+    refreshSongList();
+    currentScreen = 'song-select';
+  }
+
+  function toSongSelect() {
+    refreshSongList();
+    currentScreen = 'song-select';
+  }
+
+  function toHome() {
+    currentScreen = 'home';
+  }
+
+  // Song selection handler
+  async function handleSelectSong(songItem: SongListItem) {
+    // Skip the redundant download/extract only if this song is actually loaded.
+    // (The initial placeholder has no media, so it must not short-circuit a real load.)
+    const alreadyLoaded =
+      activeSong &&
+      activeSong.id === songItem.id &&
+      !!(activeSong.audioBlobUrl || activeSong.audioBlob || activeSong.archiveBlob);
+    if (alreadyLoaded) {
+      if (activeSong.levels.length > 0) {
+        activeLevel = activeSong.levels[0];
+        activeTrackData = activeLevel.trackData;
+      }
+      audioBlobUrl = activeSong.audioBlobUrl;
+      videoBlobUrl = activeSong.videoBlobUrl;
+      if (audioElement) {
+        syncEngine.attach(audioElement, videoElement);
+      }
+      currentScreen = songSelectMode === 'play' ? 'level-select' : 'edit';
+      return;
+    }
+
+    isLoadingSong = true;
+    songLoadingProgress = 10;
+    errorMessage = null;
+    try {
+      activeSong = await loadSong(songItem, (pct) => (songLoadingProgress = pct));
+      if (activeSong.levels.length > 0) {
+        activeLevel = activeSong.levels[0];
+        activeTrackData = activeLevel.trackData;
+      }
+      audioBlobUrl = activeSong.audioBlobUrl;
+      videoBlobUrl = activeSong.videoBlobUrl;
+      if (audioElement) {
+        syncEngine.attach(audioElement, videoElement);
+      }
+
+      if (songSelectMode === 'play') {
+        currentScreen = 'level-select';
+      } else {
+        currentScreen = 'edit';
+      }
+    } catch (err: any) {
+      console.error('Failed to load song:', err);
+      errorMessage = err?.message || '曲アーカイブの読み込みに失敗';
+    } finally {
+      isLoadingSong = false;
+    }
+  }
+
+  function handleAddSong() {
+    activeSong = createDefaultSong('新しい曲');
+    if (activeSong.levels.length > 0) {
+      activeLevel = activeSong.levels[0];
+      activeTrackData = activeLevel.trackData;
+    }
+    audioBlobUrl = null;
+    videoBlobUrl = null;
+    currentScreen = 'edit';
+  }
+
+  async function handleImportArchive(file: File) {
+    isLoadingSong = true;
+    songLoadingProgress = 20;
+    errorMessage = null;
+    try {
+      activeSong = await unpackSongArchive(file);
+      if (activeSong.levels.length > 0) {
+        activeLevel = activeSong.levels[0];
+        activeTrackData = activeLevel.trackData;
+      }
+      audioBlobUrl = activeSong.audioBlobUrl;
+      videoBlobUrl = activeSong.videoBlobUrl;
+      currentScreen = 'edit';
+    } catch (err: any) {
+      console.error('Failed to unpack song archive:', err);
+      errorMessage = err?.message || '曲アーカイブの展開に失敗';
+    } finally {
+      isLoadingSong = false;
+    }
+  }
+
+  async function handleDeleteSong(songId: string) {
+    try {
+      await deleteStoredSong(songId);
+      await refreshSongList();
+    } catch (err: any) {
+      errorMessage = `Failed to delete song: ${err.message || err}`;
+    }
+  }
+
+  async function handleBackupSongFromList(songItem: SongListItem) {
+    try {
+      const songData = await loadSong(songItem);
+      const archiveBlob = await packSongArchive(songData);
+      downloadBlob(archiveBlob, `${songData.name || 'song'}.zip`);
+    } catch (err: any) {
+      errorMessage = `Failed to backup song: ${err.message || err}`;
+    }
+  }
+
+  // Play specific level
+  async function handleSelectAndPlaySongLevel(level: SongLevel) {
+    try {
+      activeLevel = level;
+      activeTrackData = level.trackData;
+      audioBlobUrl = activeSong.audioBlobUrl;
+      videoBlobUrl = activeSong.videoBlobUrl;
+
+      currentScreen = 'playing';
+      isPaused = false;
+      isGameFinished = false;
+      finalGameStats = null;
+      gameElapsedSec = 0;
+      currentGameScore = 0;
+      currentGameCombo = 0;
+      errorMessage = null;
+      isAwaitingAudioStart = false;
+
+      if (audioElement) {
+        syncEngine.attach(audioElement, videoElement);
+      }
+
+      // Start audio first so it consumes the current user gesture; then enter
+      // fullscreen (which can otherwise steal the transient activation).
+      await syncEngine.play();
+
+      viewportManager?.requestFullscreen().catch((err: unknown) => {
+        console.warn('Fullscreen request bypassed:', err);
+      });
+
+      // If autoplay was blocked (e.g. the level was started from the phone
+      // remote, which has no desktop user gesture), prompt for a single tap.
+      if (!syncEngine.isPlaying) {
+        isAwaitingAudioStart = true;
+      }
+    } catch (err: any) {
+      console.error('Failed to start level playback:', err);
+      errorMessage = err?.message || '再生の開始に失敗';
+    }
+  }
+
+  async function handlePlaySongLevelFromEditor(song: SongData, level: SongLevel) {
+    activeSong = song;
+    audioBlobUrl = song.audioBlobUrl;
+    videoBlobUrl = song.videoBlobUrl;
+    launchedFromEditor = true;
+    await handleSelectAndPlaySongLevel(level);
+  }
+
+  function handleSongSaved(savedSong: SongData) {
+    activeSong = savedSong;
+    refreshSongList();
+  }
+
+  // Chart completion handler
+  function handleGameComplete(
+    score: number,
+    maxCombo: number,
+    totalNotes: number,
+    hitNotes: number
+  ) {
+    syncEngine.pause();
+    stopOvertimeLoop();
+    isGameFinished = true;
+    finalGameStats = { score, maxCombo, totalNotes, hitNotes };
+  }
+
+  // Pause / Resume / Restart / Exit handlers
+  function handlePause() {
+    if (currentScreen !== 'playing' || isGameFinished) return;
+    isPaused = true;
+    stopOvertimeLoop();
+    syncEngine.pause();
+  }
+
+  async function handleResume() {
+    if (currentScreen !== 'playing' || isGameFinished) return;
+    isPaused = false;
+    try {
+      if (syncDuration > 0 && syncCurrentTime < syncDuration) {
+        await syncEngine.play();
+      } else if (chartDuration > syncDuration) {
+        startOvertimeLoop();
+      }
+    } catch (err: any) {
+      console.error('Failed to resume playback:', err);
+      errorMessage = err?.message || '再開に失敗';
+    }
+  }
+
+  async function handleRestart() {
+    stopOvertimeLoop();
+    syncEngine.seek(0);
+    gameElapsedSec = 0;
+    isPaused = false;
+    isGameFinished = false;
+    finalGameStats = null;
+    currentGameScore = 0;
+    currentGameCombo = 0;
+    try {
+      await syncEngine.play();
+    } catch (err: any) {
+      console.error('Failed to restart playback:', err);
+      errorMessage = err?.message || '最初から再生に失敗';
+    }
+  }
+
+  function handleExitToMenu() {
+    stopOvertimeLoop();
+    syncEngine.pause();
+    syncEngine.seek(0);
+    gameElapsedSec = 0;
+    isPaused = false;
+    isGameFinished = false;
+    finalGameStats = null;
+    currentScreen = launchedFromEditor ? 'edit' : 'level-select';
+    launchedFromEditor = false;
+  }
+
+  function togglePause() {
+    if (isGameFinished) return;
+    if (isPaused) {
+      handleResume();
+    } else {
+      handlePause();
+    }
+  }
+
+  function startAudioFromPrompt() {
+    isAwaitingAudioStart = false;
+    syncEngine.play().catch((err: unknown) => {
+      console.warn('Failed to start audio from prompt:', err);
     });
-
-    status = 'センサー有効 🟢';
   }
 
-  function handlePointer(side: 'LEFT' | 'RIGHT', action: 'DOWN' | 'UP') {
-    if (!sendAction || !hostPeerId) return;
+  // Remote commands sent from the phone controller.
+  function handleControllerCommand(command: ControllerCommand, id = '') {
+    switch (command) {
+      case 'start':
+        startFromController();
+        break;
+      case 'level-select':
+        chooseLevelFromController();
+        break;
+      case 'pause':
+        if (currentScreen === 'playing') togglePause();
+        break;
+      case 'restart':
+        if (currentScreen === 'playing') handleRestart();
+        break;
+      case 'play':
+        toPlaySongSelect();
+        break;
+      case 'edit':
+        toManageSongSelect();
+        break;
+      case 'back':
+        handleRemoteBack();
+        break;
+      case 'quit':
+        if (currentScreen === 'playing') handleExitToMenu();
+        break;
+      case 'up':
+        handleRemoteMove(-1);
+        break;
+      case 'down':
+        handleRemoteMove(1);
+        break;
+      case 'ok':
+        handleRemoteConfirm();
+        break;
+    }
 
-    if (side === 'LEFT') phoneState.left = action === 'DOWN';
-    if (side === 'RIGHT') phoneState.right = action === 'DOWN';
-
-    const taps = action === 'DOWN' ? [side] : [];
-
-    sendAction.send({
-      left: phoneState.left,
-      right: phoneState.right,
-      tilt: phoneState.tilt,
-      taps: taps
-    }, { target: hostPeerId });
+    // Immediately push the latest state back to phones so the remote UI
+    // reflects synchronous navigation (back/play/edit/pause/quit, etc.).
+    broadcastControllerState();
   }
+
+  function handleRemoteBack() {
+    switch (currentScreen) {
+      case 'song-select':
+        toHome();
+        break;
+      case 'level-select':
+      case 'edit':
+        toSongSelect();
+        break;
+      default:
+        break;
+    }
+  }
+
+  function handleRemoteMove(delta: number) {
+    if (currentScreen === 'song-select') {
+      const len = displayedSongs.length;
+      if (len === 0) return;
+      remoteSongCursor = ((remoteSongCursor + delta) % len + len) % len;
+    } else if (currentScreen === 'level-select') {
+      const len = activeSong?.levels?.length || 0;
+      if (len === 0) return;
+      remoteLevelCursor = ((remoteLevelCursor + delta) % len + len) % len;
+    }
+  }
+
+  function handleRemoteConfirm() {
+    if (currentScreen === 'song-select') {
+      const song = displayedSongs[remoteSongCursor];
+      if (song) handleSelectSong(song);
+    } else if (currentScreen === 'level-select') {
+      const level = activeSong?.levels?.[remoteLevelCursor];
+      if (level) handleSelectAndPlaySongLevel(level);
+    }
+  }
+
+  function startFromController() {
+    // Already playing: ignore (use restart to replay).
+    if (currentScreen === 'playing') return;
+    const hasLoadedSong = !!(
+      activeSong &&
+      (activeSong.audioBlobUrl || activeSong.audioBlob || activeSong.archiveBlob)
+    );
+    if (hasLoadedSong && activeLevel && activeLevel.trackData) {
+      handleSelectAndPlaySongLevel(activeLevel);
+    } else {
+      chooseLevelFromController();
+    }
+  }
+
+  function chooseLevelFromController() {
+    handleExitToMenu();
+  }
+
+  function handleScoreUpdate(score: number, combo: number) {
+    currentGameScore = score;
+    currentGameCombo = combo;
+  }
+
+  function formatTime(seconds: number): string {
+    if (!seconds || isNaN(seconds) || seconds < 0) return '00:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  onDestroy(() => {
+    stopOvertimeLoop();
+    webrtcHost?.stop();
+    unsubscribeSync?.();
+    syncEngine?.destroy();
+    revokeMediaBlob(audioBlobUrl);
+    revokeMediaBlob(videoBlobUrl);
+  });
 </script>
 
-{#if role === 'desktop'}
-  <div class="fixed inset-0 bg-[#020617] overflow-hidden flex items-center justify-center font-sans tracking-tight text-white">
-    <div class="absolute inset-0 z-0 bg-[linear-gradient(to_right,#1e293b_1px,transparent_1px),linear-gradient(to_bottom,#1e293b_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20"></div>
+<svelte:window
+  onkeydown={(e: KeyboardEvent) => {
+    if (!isControllerMode && currentScreen === 'playing' && e.key === 'Escape') {
+      e.preventDefault();
+      togglePause();
+    }
+  }}
+/>
 
-    {#if (!isConnected || qrUrl) && !isConnected}
-      <div class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-md">
-        <p class="text-[#00f3ff] mb-8 font-mono text-2xl uppercase tracking-widest border-b-2 border-[#00f3ff] pb-2">{status}</p>
-        <div class="bg-white p-6 rounded-none border-4 border-[#00f3ff] relative">
-          <div class="absolute -top-2 -left-2 w-4 h-4 border-t-4 border-l-4 border-white"></div>
-          <div class="absolute -bottom-2 -right-2 w-4 h-4 border-b-4 border-r-4 border-white"></div>
-          {#if qrDataUrl}
-            <img src={qrDataUrl} alt="Join Game QR Code" class="w-[300px] h-[300px]" />
-          {/if}
-        </div>
-      </div>
-    {/if}
+{#if isControllerMode}
+  <!-- Phone Controller Route (Directly rendered on mobile scan) -->
+  <PhoneController initialRoomId={controllerInitialRoom} />
+{:else}
+  <!-- Desktop Game View -->
+  <!-- SVG Paper Filters for Hand-Crafted Jagged Edges -->
+  <PaperSvgFilters />
 
-    {#if isConnected && !isPlaying}
-      <div class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-md">
-        <p class="text-[#ff00ea] font-mono text-3xl uppercase tracking-widest border-y-2 border-[#ff00ea] py-4 px-8">{status}</p>
-      </div>
-    {/if}
+  <!-- Invisible Master Audio Element fed with local Blob URL or stream -->
+  <audio
+    bind:this={audioElement}
+    src={audioBlobUrl || activeSong?.audioBlobUrl || ''}
+    preload="auto"
+    style="position: fixed; width: 0; height: 0; opacity: 0; pointer-events: none;"
+  ></audio>
 
-    <div class="absolute top-8 left-8 text-white z-40 flex flex-col gap-1">
-      <p class="text-6xl font-black italic tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-white to-slate-500 drop-shadow-md">
-        {score.toString().padStart(6, '0')}
-      </p>
-      <div class="flex items-center gap-3">
-        <div class="w-12 h-1 bg-slate-700"></div>
-        <p class="text-2xl font-mono font-bold uppercase tracking-widest transition-colors duration-100 {combo > 5 ? 'text-[#00f3ff]' : 'text-slate-500'}">
-          x{combo} Combo
-        </p>
-      </div>
-    </div>
-
-    <div class="absolute w-[60vw] h-[60vw] rounded-full border-[2px] border-dashed border-white/20 pointer-events-none z-20 flex items-center justify-center">
-      <div class="w-full h-full rounded-full border-[1px] border-white/5 scale-[1.05]"></div>
-      <div class="absolute w-full h-full rounded-full border-[1px] border-white/5 scale-[0.95]"></div>
-    </div>
-
-    {#each hits as hit (hit.id)}
-      <div
-        class="absolute top-1/2 left-1/2 w-[8vw] h-[8vw] -mt-[4vw] -ml-[4vw] rounded-full z-50 pointer-events-none"
-        style="--angle: {hit.angle}deg; border-color: {hit.angle > 90 && hit.angle < 270 ? '#00f3ff' : '#ff00ea'}; animation: hitPingCrisp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;"
-      ></div>
-    {/each}
-
-    {#each notes.filter(n => n.type === 'DOUBLE' && n.side === 'RIGHT') as note (note.id)}
-      <div
-        class="absolute top-1/2 left-1/2 w-[100vw] h-[2px] -mt-[1px] -ml-[50vw] bg-transparent border-t-[2px] border-dashed border-white/40 z-10"
-        style="--angle: {note.angle}deg; animation: expandLine {note.travelTime}ms linear forwards;"
-      ></div>
-    {/each}
-
-    {#each notes as note (note.id)}
-      <div
-        class="absolute top-1/2 left-1/2 w-8 h-8 -mt-4 -ml-4 z-30 flex items-center justify-center"
-        style="color: {note.side === 'LEFT' ? '#00f3ff' : '#ff00ea'}; --angle: {note.angle}deg; animation: flyOut {note.travelTime}ms linear forwards; transform-origin: 50% 50%;"
-      >
-        <div class="w-full h-full border-[3px] border-current bg-[#020617] rotate-45 transition-all"></div>
-      </div>
-    {/each}
-
-    <div class="absolute w-16 h-16 bg-[#020617] border-[4px] border-slate-800 rounded-full z-10 flex items-center justify-center shadow-2xl pointer-events-none">
-      <div class="w-4 h-4 bg-white/20 rounded-full"></div>
-    </div>
-
+  <main
+    class="fixed inset-0 w-full h-full overflow-hidden bg-black select-none"
+    role="presentation"
+  >
+    <!-- Auto-Oriented Game Viewport Container -->
     <div
-      bind:this={steeringContainerRef}
-      class="absolute w-full px-[20vw] flex justify-between items-center z-40 pointer-events-none"
+      class="absolute top-0 left-0 overflow-hidden bg-black"
+      style="
+        width: {layout.containerWidth}px;
+        height: {layout.containerHeight}px;
+        transform: {layout.transform};
+        transform-origin: {layout.transformOrigin};
+        will-change: transform, width, height;
+      "
     >
-      <div class="absolute inset-x-0 h-[1px] bg-white/10 -z-10 mx-[20vw]"></div>
+      <!-- Video Background Layer (Fades to solid black if chart is longer than video) -->
+      {#if videoBlobUrl || activeSong?.videoBlobUrl}
+        <video
+          bind:this={videoElement}
+          src={videoBlobUrl || activeSong?.videoBlobUrl}
+          preload="auto"
+          muted
+          playsinline
+          disablepictureinpicture
+          disableremoteplayback
+          class="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-700"
+          style="
+            opacity: {isVideoFinished ? 0 : 0.5};
+          "
+          onplaying={() => console.log('[Video] Background video playing')}
+          onerror={(e) => {
+            const target = e.currentTarget as HTMLVideoElement;
+            if (target && target.src && target.error) {
+              console.warn('[Video] Playback warning code:', target.error.code, target.error.message);
+            }
+          }}
+        ></video>
+      {/if}
 
-      <div class="relative flex items-center justify-center w-12 h-24 border-r-4 transition-all duration-75 {playerState.left ? 'border-[#00f3ff] bg-[#00f3ff]/10 scale-110 translate-x-4' : 'border-slate-700 bg-slate-900/50'}">
-        <div class="absolute left-0 w-full h-[2px] transition-colors {playerState.left ? 'bg-[#00f3ff]' : 'bg-slate-700'}"></div>
-      </div>
+      <!-- 2D Paper Rhythm Track Layer -->
+      {#if currentScreen === 'playing'}
+        <RhythmPlayCanvas
+          bind:this={rhythmCanvas}
+          trackData={activeTrackData}
+          currentTimeSec={gameElapsedSec}
+          {isPaused}
+          containerWidth={layout.containerWidth}
+          containerHeight={layout.containerHeight}
+          onScoreChange={handleScoreUpdate}
+          onGameComplete={handleGameComplete}
+          onDurationCalculated={(dur) => (chartDuration = dur)}
+        />
+      {/if}
 
-      <div class="relative flex items-center justify-center w-12 h-24 border-l-4 transition-all duration-75 {playerState.right ? 'border-[#ff00ea] bg-[#ff00ea]/10 scale-110 -translate-x-4' : 'border-slate-700 bg-slate-900/50'}">
-        <div class="absolute right-0 w-full h-[2px] transition-colors {playerState.right ? 'bg-[#ff00ea]' : 'bg-slate-700'}"></div>
-      </div>
-    </div>
-  </div>
+      <!-- In-Game Top-Left Pause Button -->
+      {#if currentScreen === 'playing' && !isPaused && !isGameFinished}
+        <button
+          onclick={togglePause}
+          class="paper-btn absolute top-4 left-4 z-40 px-3.5 py-2 bg-[#fffdfa]/95 hover:bg-white text-[#292524] text-xs font-mono font-bold tracking-wider flex items-center gap-2 cursor-pointer shadow-[3px_3px_0px_#292524]"
+          title="一時停止 (Esc)"
+          aria-label="ゲームを一時停止"
+        >
+          <span class="inline-flex gap-0.5 items-center">
+            <span class="w-1.5 h-3 bg-[#292524]"></span>
+            <span class="w-1.5 h-3 bg-[#292524]"></span>
+          </span>
+          <span>一時停止</span>
+          <span class="text-[10px] text-[#292524]/60 font-normal">[ESC]</span>
+        </button>
+      {/if}
 
-{:else if role === 'phone'}
-  <div class="fixed inset-0 bg-[#020617] overflow-hidden touch-none select-none font-sans uppercase tracking-widest text-white font-bold">
-    <div class="absolute top-1/2 left-1/2 w-[100vh] h-[100vw] sm:w-[100vw] sm:h-[100vh] -translate-x-1/2 -translate-y-1/2 portrait:-rotate-90 landscape:rotate-0 flex p-4 gap-4 box-border">
+      <!-- In-Game Score & Combo HUD Pill (Top Center) -->
+      {#if currentScreen === 'playing'}
+        <div class="absolute top-4 left-1/2 -translate-x-1/2 z-40 px-4 py-1.5 bg-[#fffdfa]/95 border-[1.5px] border-[#292524] shadow-[3px_3px_0px_#292524] flex items-center gap-4 text-xs font-mono font-black tracking-wider text-[#292524]">
+          <div class="flex items-center gap-1.5">
+            <span class="text-[#292524]/60 font-normal">{activeSong.name} [{activeLevel.name}]:</span>
+            <span>{currentGameScore}</span>
+          </div>
+          <div class="w-px h-3.5 bg-[#292524]/30"></div>
+          <div class="flex items-center gap-1.5">
+            <span class="text-[#292524]/60 font-normal">コンボ:</span>
+            <span class="text-[#d97706]">{currentGameCombo}</span>
+          </div>
+          <div class="w-px h-3.5 bg-[#292524]/30"></div>
+          <div class="flex items-center gap-1.5 text-[11px] font-normal text-[#292524]/70">
+            <span>{formatTime(gameElapsedSec)} / {formatTime(chartDuration || syncDuration)}</span>
+          </div>
+        </div>
+      {/if}
 
-      {#if !status.includes('有効')}
-        <div class="absolute inset-0 flex flex-col items-center justify-center z-50 bg-slate-950/95 portrait:rotate-90 landscape:rotate-0 backdrop-blur-sm">
-          <p class="text-[#00f3ff] mb-12 font-mono text-xl text-center border-b-2 border-[#00f3ff] pb-2">{status}</p>
-          {#if status.includes('準備完了')}
-            <button
-              onpointerdown={requestSensors}
-              class="px-10 py-5 bg-transparent border-2 border-[#00f3ff] text-[#00f3ff] active:bg-[#00f3ff] active:text-[#020617] font-bold rounded-none text-xl transition-colors"
-            >
-              START ENGINE
-            </button>
+      <!-- In-Game Controller Connected Badge on Top-Right -->
+      {#if currentScreen === 'playing' && connectedPeersCount > 0}
+        <div class="absolute top-4 right-4 z-40 px-3 py-1.5 bg-[#fffdfa]/90 border-[1.5px] border-[#292524] text-[10px] font-mono font-bold text-[#292524] flex items-center gap-2 shadow-[2px_2px_0px_#292524]">
+          <span class="w-2 h-2 bg-emerald-500 inline-block animate-pulse"></span>
+          <span>スマホ接続済み</span>
+          {#if lastReceivedKey}
+            <span class="px-1.5 py-0.2 bg-[#d8ecd7] border border-[#292524]/40">
+              {lastReceivedKey}
+            </span>
           {/if}
         </div>
       {/if}
 
-      <!-- Left button -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        onpointerdown={() => handlePointer('LEFT', 'DOWN')}
-        onpointerup={() => handlePointer('LEFT', 'UP')}
-        onpointercancel={() => handlePointer('LEFT', 'UP')}
-        class="relative flex-1 h-full rounded-2xl border-2 overflow-hidden transition-colors duration-75 border-slate-800 bg-slate-900/50 active:border-[#00f3ff] active:bg-[#00f3ff]/20"
-      >
-        <div class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
-          <span class="text-6xl text-[#00f3ff]">&lt;</span>
-        </div>
-      </div>
+      <!-- In-Game Bottom Touch Lanes (For direct touch screen / mobile players) -->
+      {#if currentScreen === 'playing' && !isPaused && !isGameFinished}
+        <div class="absolute bottom-4 left-4 right-4 z-40 flex items-center justify-between pointer-events-none">
+          <button
+            type="button"
+            ontouchstart={(e) => { e.preventDefault(); rhythmCanvas?.handleRhythmInput('z'); }}
+            onmousedown={() => rhythmCanvas?.handleRhythmInput('z')}
+            class="paper-btn pointer-events-auto px-6 py-3 bg-[#dbeafe]/90 active:bg-[#bfdbfe] text-[#1d4ed8] font-mono font-bold text-sm tracking-wider shadow-[3px_3px_0px_#292524] flex items-center gap-2 cursor-pointer"
+          >
+            <span class="w-3 h-3 bg-[#3b82f6]"></span>
+            <span>青 [Z / D]</span>
+          </button>
 
-      <!-- Right button -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        onpointerdown={() => handlePointer('RIGHT', 'DOWN')}
-        onpointerup={() => handlePointer('RIGHT', 'UP')}
-        onpointercancel={() => handlePointer('RIGHT', 'UP')}
-        class="relative flex-1 h-full rounded-2xl border-2 overflow-hidden transition-colors duration-75 border-slate-800 bg-slate-900/50 active:border-[#ff00ea] active:bg-[#ff00ea]/20"
-      >
-        <div class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
-          <span class="text-6xl text-[#ff00ea]">&gt;</span>
+          <button
+            type="button"
+            ontouchstart={(e) => { e.preventDefault(); rhythmCanvas?.handleRhythmInput('x'); }}
+            onmousedown={() => rhythmCanvas?.handleRhythmInput('x')}
+            class="paper-btn pointer-events-auto px-6 py-3 bg-[#d8ecd7]/90 active:bg-[#a8d5a6] text-[#047857] font-mono font-bold text-sm tracking-wider shadow-[3px_3px_0px_#292524] flex items-center gap-2 cursor-pointer"
+          >
+            <span>緑 [X / K]</span>
+            <span class="w-3 h-3 bg-[#047857]"></span>
+          </button>
         </div>
-      </div>
+      {/if}
 
+      <!-- Tap-to-start prompt (autoplay blocked until a desktop gesture) -->
+      {#if currentScreen === 'playing' && isAwaitingAudioStart && !isPaused && !isGameFinished}
+        <div class="absolute inset-0 z-50 bg-[#292524]/70 backdrop-blur-[2px] flex items-center justify-center p-4 select-none">
+          <div class="paper-card jagged-border bg-[#fffdfa] w-full max-w-sm p-8 flex flex-col items-center gap-4">
+            <span class="text-3xl">🔊</span>
+            <h2 class="text-xl font-black font-mono text-[#292524]">タップで開始</h2>
+            <p class="text-xs font-mono text-[#292524]/70 text-center">音声を再生するには、この画面を一度タップする必要があります。</p>
+            <button
+              onclick={startAudioFromPrompt}
+              class="paper-btn w-full py-3 bg-[#d8ecd7] hover:bg-[#c5dac1] text-[#292524] font-mono font-bold tracking-widest text-sm cursor-pointer"
+            >
+              ▶ 開始
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      <!-- In-Game Pause Overlay Modal -->
+      {#if currentScreen === 'playing' && isPaused && !isGameFinished}
+        <PauseOverlay
+          levelName="{activeSong.name} - {activeLevel.name}"
+          currentTimeSec={gameElapsedSec}
+          durationSec={chartDuration || syncDuration}
+          onResume={handleResume}
+          onRestart={handleRestart}
+          onExit={handleExitToMenu}
+        />
+      {/if}
+
+      <!-- Stage Clear / Results Modal -->
+      {#if currentScreen === 'playing' && isGameFinished && finalGameStats}
+        <StageClearOverlay
+          levelName="{activeSong.name} - {activeLevel.name}"
+          score={finalGameStats.score}
+          maxCombo={finalGameStats.maxCombo}
+          hitNotes={finalGameStats.hitNotes}
+          totalNotes={finalGameStats.totalNotes}
+          onPlayAgain={handleRestart}
+          onLevelSelect={handleExitToMenu}
+        />
+      {/if}
+
+      <!-- Solid Paper Menus overlaying the game viewport -->
+      {#if currentScreen === 'home'}
+        <div class="absolute inset-0 z-30">
+          <HomeScreen
+            onPlay={toPlaySongSelect}
+            onManageSongs={toManageSongSelect}
+            {roomId}
+            {controllerUrl}
+            {qrDataUrl}
+            {connectedPeersCount}
+            {lastReceivedKey}
+          />
+        </div>
+      {:else if currentScreen === 'song-select'}
+        <div class="absolute inset-0 z-30">
+          <SongSelect
+            mode={songSelectMode}
+            songs={availableSongs}
+            selectedSongId={activeSong?.id}
+            isLoading={isLoadingSong}
+            loadingProgress={songLoadingProgress}
+            onSelectSong={handleSelectSong}
+            onAddSong={handleAddSong}
+            onImportArchive={handleImportArchive}
+            onDeleteSong={handleDeleteSong}
+            onBackupSong={handleBackupSongFromList}
+            onBack={toHome}
+            focusedIndex={remoteSongCursor}
+          />
+        </div>
+      {:else if currentScreen === 'level-select'}
+        <div class="absolute inset-0 z-30">
+          <LevelSelect
+            song={activeSong}
+            levels={activeSong?.levels || []}
+            selectedLevel={activeLevel}
+            onSelectLevel={handleSelectAndPlaySongLevel}
+            onBack={toSongSelect}
+            focusedIndex={remoteLevelCursor}
+          />
+        </div>
+      {:else if currentScreen === 'edit'}
+        <div class="absolute inset-0 z-30">
+          <EditScreen
+            initialSong={activeSong}
+            initialTrackData={activeTrackData}
+            audioBlobUrl={audioBlobUrl || activeSong?.audioBlobUrl}
+            videoBlobUrl={videoBlobUrl || activeSong?.videoBlobUrl}
+            videoDuration={syncDuration}
+            onSaveSong={handleSongSaved}
+            onPlaySongLevel={handlePlaySongLevelFromEditor}
+            onBack={toSongSelect}
+          />
+        </div>
+      {/if}
+
+      <!-- Global Error Banner if any error occurs -->
+      {#if errorMessage}
+        <div class="paper-card absolute bottom-4 left-1/2 -translate-x-1/2 z-50 bg-[#fce1db] border-[1.5px] border-[#292524] px-4 py-2 text-xs font-mono text-[#292524] flex items-center gap-3 shadow-[3px_3px_0px_#292524]">
+          <span>⚠ {errorMessage}</span>
+          <button
+            onclick={() => (errorMessage = null)}
+            class="font-bold underline cursor-pointer"
+          >
+            閉じる
+          </button>
+        </div>
+      {/if}
     </div>
-  </div>
-
-{:else}
-  <div class="fixed inset-0 bg-[#020617] flex items-center justify-center text-white font-mono tracking-widest uppercase">
-    Initializing...
-  </div>
+  </main>
 {/if}
-
-<style>
-  @keyframes flyOut {
-    0% { transform: rotate(var(--angle)) translateX(0) scale(0); opacity: 0; }
-    5% { opacity: 1; scale: 0.5; }
-    80% { opacity: 1; }
-    100% { transform: rotate(var(--angle)) translateX(50vw) scale(1.2); opacity: 0; }
-  }
-  @keyframes expandLine {
-    0% { transform: rotate(var(--angle)) scaleX(0); opacity: 0; }
-    5% { opacity: 1; }
-    80% { opacity: 1; }
-    100% { transform: rotate(var(--angle)) scaleX(1); opacity: 0; }
-  }
-  @keyframes hitPingCrisp {
-    0% { transform: rotate(var(--angle)) translateX(30vw) scale(0.6); opacity: 1; border-width: 8px; border-style: solid; }
-    100% { transform: rotate(var(--angle)) translateX(30vw) scale(2); opacity: 0; border-width: 1px; border-style: solid; }
-  }
-</style>

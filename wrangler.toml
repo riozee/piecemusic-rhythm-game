@@ -1,0 +1,9 @@
+name = "piecemusic-rhythm-game"
+main = "worker/index.ts"
+compatibility_date = "2026-09-11"
+
+# Workers Static Assets: the Vite build output is uploaded and served directly.
+# Requests that don't match a file in ./dist are routed to worker/index.ts.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
