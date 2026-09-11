@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "deploy": "bun run build && wrangler deploy",
+    "cf:dev": "wrangler dev",
+    "upload:levels": "node scripts/upload-levels.mjs",
+    "postinstall": "node scripts/patch-trystero.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
@@ -15,14 +19,20 @@
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^24.13.3",
     "@types/qrcode": "^1.5.6",
+    "@types/three": "^0.185.4",
     "svelte": "^5.56.8",
     "svelte-check": "^4.7.3",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
-    "vite": "^8.2.0"
+    "vite": "^8.2.0",
+    "wrangler": "^4.131.0"
   },
   "dependencies": {
+    "@threlte/core": "^8.6.0",
+    "@threlte/extras": "^9.21.1",
     "@trystero-p2p/mqtt": "^0.25.3",
-    "qrcode": "^1.5.4"
+    "fflate": "^0.8.3",
+    "qrcode": "^1.5.4",
+    "three": "^0.185.1"
   }
 }

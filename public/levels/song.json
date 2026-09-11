@@ -1,0 +1,16 @@
+{
+  "id": "____",
+  "name": "逆転",
+  "artist": "",
+  "audioFile": "audio.opus",
+  "videoFile": "video.mp4",
+  "levels": [
+    {
+      "id": "standard",
+      "name": "Standard",
+      "difficulty": 5,
+      "chartFile": "levels/standard.json"
+    }
+  ],
+  "updatedAt": 1789095254438
+}
