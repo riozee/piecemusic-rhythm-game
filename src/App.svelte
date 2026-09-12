@@ -435,7 +435,7 @@
   }
 
   // Play specific level
-  async function handleSelectAndPlaySongLevel(level: SongLevel) {
+  async function handleSelectAndPlaySongLevel(level: SongLevel, startTimeSec = 0) {
     try {
       activeLevel = level;
       activeTrackData = level.trackData;
@@ -446,7 +446,7 @@
       isPaused = false;
       isGameFinished = false;
       finalGameStats = null;
-      gameElapsedSec = 0;
+      gameElapsedSec = startTimeSec;
       currentGameScore = 0;
       currentGameCombo = 0;
       errorMessage = null;
@@ -454,6 +454,9 @@
 
       if (audioElement) {
         syncEngine.attach(audioElement, videoElement);
+        if (startTimeSec > 0) {
+          await seekAudioTo(startTimeSec);
+        }
       }
 
       // Start audio first so it consumes the current user gesture; then enter
@@ -475,12 +478,42 @@
     }
   }
 
-  async function handlePlaySongLevelFromEditor(song: SongData, level: SongLevel) {
+  // Seek the master audio to a target time, waiting for its metadata to load
+  // first (needed when the audio src changed in the same tick).
+  async function seekAudioTo(timeSec: number): Promise<void> {
+    const audio = audioElement;
+    if (!audio) return;
+
+    // Let Svelte flush any pending src attribute change.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    if (audio.readyState >= 1 && !isNaN(audio.duration)) {
+      syncEngine.seek(timeSec);
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      audio.addEventListener('loadedmetadata', done, { once: true });
+      audio.addEventListener('error', done, { once: true });
+      setTimeout(done, 4000);
+    });
+
+    syncEngine.seek(timeSec);
+  }
+
+  async function handlePlaySongLevelFromEditor(song: SongData, level: SongLevel, startTimeSec = 0) {
     activeSong = song;
     audioBlobUrl = song.audioBlobUrl;
     videoBlobUrl = song.videoBlobUrl;
     launchedFromEditor = true;
-    await handleSelectAndPlaySongLevel(level);
+    await handleSelectAndPlaySongLevel(level, startTimeSec);
   }
 
   function handleSongSaved(savedSong: SongData) {

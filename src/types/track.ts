@@ -44,6 +44,9 @@ export interface TrackData {
   offsetBPs: OffsetBreakpoint[];
   notes: TrackNote[];
   decorations: TrackDecoration[];
+  markers: number[];
+  planeOriginX: number;
+  planeOriginY: number;
   planeW: number;
   planeH: number;
 }
