@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   interface Props {
     levelName: string;
     currentTimeSec: number;
@@ -27,6 +29,53 @@
   const progressPercent = $derived(
     durationSec > 0 ? Math.min(100, Math.max(0, (currentTimeSec / durationSec) * 100)) : 0
   );
+
+  // --- Auto-restart after 15 seconds of inactivity ---
+  const AUTO_RESTART_MS = 15_000;
+  let autoRestartRemaining = $state(AUTO_RESTART_MS);
+  let autoRestartRafId: number | null = null;
+  let autoRestartDeadline = $state(0);
+
+  function resetAutoRestart() {
+    autoRestartDeadline = performance.now() + AUTO_RESTART_MS;
+    autoRestartRemaining = AUTO_RESTART_MS;
+  }
+
+  function tickAutoRestart() {
+    const now = performance.now();
+    const left = autoRestartDeadline - now;
+    autoRestartRemaining = Math.max(0, left);
+    if (left <= 0) {
+      onRestart();
+      return;
+    }
+    autoRestartRafId = requestAnimationFrame(tickAutoRestart);
+  }
+
+  function cleanupAutoRestart() {
+    if (autoRestartRafId != null) { cancelAnimationFrame(autoRestartRafId); autoRestartRafId = null; }
+  }
+
+  function handleActivity() {
+    resetAutoRestart();
+  }
+
+  onMount(() => {
+    resetAutoRestart();
+    autoRestartRafId = requestAnimationFrame(tickAutoRestart);
+
+    // Reset timer on any user interaction
+    const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'pointerdown'] as const;
+    for (const evt of events) window.addEventListener(evt, handleActivity, { passive: true });
+
+    return () => {
+      cleanupAutoRestart();
+      for (const evt of events) window.removeEventListener(evt, handleActivity);
+    };
+  });
+
+  const autoRestartSec = $derived(Math.ceil(autoRestartRemaining / 1000));
+  const autoRestartProgress = $derived(autoRestartRemaining / AUTO_RESTART_MS * 100);
 </script>
 
 <div
@@ -104,8 +153,22 @@
       </button>
     </div>
 
+    <!-- Auto-Restart Countdown -->
+    <div class="mt-4 w-full">
+      <div class="flex justify-between text-[10px] font-mono text-[#292524]/60 mb-1">
+        <span>自動リスタート</span>
+        <span>{autoRestartSec}秒</span>
+      </div>
+      <div class="w-full h-1.5 bg-neutral-200 border border-[#292524]/20 overflow-hidden">
+        <div
+          class="h-full bg-[#81c784] transition-[width] duration-100"
+          style="width: {autoRestartProgress}%"
+        ></div>
+      </div>
+    </div>
+
     <!-- Footer Note -->
-    <div class="mt-6 pt-3 border-t border-[#292524]/15 w-full text-center text-[10px] text-[#292524]/60 font-mono">
+    <div class="mt-4 pt-3 border-t border-[#292524]/15 w-full text-center text-[10px] text-[#292524]/60 font-mono">
       [ESC] で再開
     </div>
   </div>
