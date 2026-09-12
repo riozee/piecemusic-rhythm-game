@@ -35,7 +35,7 @@
     onSaveSong?: (song: SongData) => void;
     onSaveTrack?: (track: TrackData) => void;
     onPlayGame?: (track: TrackData, customMedia?: { audioUrl?: string | null; videoUrl?: string | null }) => void;
-    onPlaySongLevel?: (song: SongData, level: SongLevel) => void;
+    onPlaySongLevel?: (song: SongData, level: SongLevel, startTimeSec?: number) => void;
     onBack: () => void;
   }
 
@@ -111,6 +111,14 @@
   let decorations = $state.raw<TrackDecoration[]>(
     JSON.parse(JSON.stringify(initialActiveTrack?.decorations || []))
   );
+  // svelte-ignore state_referenced_locally
+  let markers = $state.raw<number[]>(
+    JSON.parse(JSON.stringify(initialActiveTrack?.markers || []))
+  );
+  // svelte-ignore state_referenced_locally
+  let planeOriginX = $state(initialActiveTrack?.planeOriginX || 0);
+  // svelte-ignore state_referenced_locally
+  let planeOriginY = $state(initialActiveTrack?.planeOriginY || 0);
 
   // Viewport transformation
   let panX = $state(0);
@@ -166,7 +174,9 @@
   let dragTarget:
     | { type: 'node' | 'bend'; index: number }
     | { type: 'bp'; bpType: 'speed' | 'zoom' | 'offset'; index: number }
+    | { type: 'note'; index: number; isDeco: boolean }
     | null = null;
+  let noteDragOffset = { dx: 0, dy: 0 };
   let drawingNote = $state<{ sx: number; sy: number; cx: number; cy: number } | null>(null);
   let scrubbingPreview = false;
   let previewProgress = $state(0);
@@ -290,6 +300,9 @@
         offsetBPs: JSON.parse(JSON.stringify(offsetBPs)),
         notes: JSON.parse(JSON.stringify(notes)),
         decorations: JSON.parse(JSON.stringify(decorations)),
+        markers: JSON.parse(JSON.stringify(markers)),
+        planeOriginX,
+        planeOriginY,
         planeW,
         planeH,
       };
@@ -310,6 +323,9 @@
     offsetBPs = JSON.parse(JSON.stringify(target.offsetBPs || []));
     notes = JSON.parse(JSON.stringify(target.notes || []));
     decorations = JSON.parse(JSON.stringify(target.decorations || []));
+    markers = JSON.parse(JSON.stringify(target.markers || []));
+    planeOriginX = target.planeOriginX || 0;
+    planeOriginY = target.planeOriginY || 0;
     undoStack = [];
     redoStack = [];
     syncPathMetrics();
@@ -335,6 +351,9 @@
           offsetBPs: JSON.parse(JSON.stringify(offsetBPs)),
           notes: JSON.parse(JSON.stringify(notes)),
           decorations: JSON.parse(JSON.stringify(decorations)),
+          markers: JSON.parse(JSON.stringify(markers)),
+          planeOriginX,
+          planeOriginY,
           planeW,
           planeH,
         }
@@ -408,6 +427,18 @@
   let pipTransform = $state('none');
   let pipCameraPt = $state({ x: 0, y: 0 });
   let isPipVideoFinished = $state(false);
+  // Draggable PiP panel state
+  let pipPanelEl = $state<HTMLDivElement | null>(null);
+  let pipPos = $state<{ x: number; y: number; anchoredBottom: boolean }>({
+    x: 24,
+    y: -1,
+    anchoredBottom: true,
+  });
+  let isDraggingPip = $state(false);
+  let pipDragOffset = { x: 0, y: 0 };
+  let pipPanelStyle = $derived(
+    `left: ${pipPos.x}px; ${pipPos.anchoredBottom ? 'bottom: 24px;' : `top: ${pipPos.y}px;`}`
+  );
 
   // Derived elapsed preview time in seconds
   let previewElapsedSec = $derived(
@@ -566,6 +597,9 @@
       offsetBPs,
       notes,
       decorations,
+      markers,
+      planeOriginX,
+      planeOriginY,
       planeW,
       planeH,
     });
@@ -581,6 +615,9 @@
       offsetBPs = p.offsetBPs || [];
       notes = p.notes;
       decorations = p.decorations || [];
+      markers = p.markers || [];
+      planeOriginX = p.planeOriginX || 0;
+      planeOriginY = p.planeOriginY || 0;
       planeW = p.planeW;
       planeH = p.planeH;
     } catch (err) {
@@ -682,6 +719,30 @@
         }
       }
 
+      if (!deleted && activeTool === 'DRAW') {
+        // Remove the node under the cursor (right-click in draw mode).
+        let hitIdx = -1;
+        for (let i = 0; i < nodes.length; i++) {
+          if (dist(coords.x, coords.y, nodes[i].x, nodes[i].y) < 18) {
+            hitIdx = i;
+            break;
+          }
+        }
+        if (hitIdx >= 0 && nodes.length > 2) {
+          dragStateBackup = captureState();
+          nodes.splice(hitIdx, 1);
+          nodes = [...nodes];
+          const newBends: Record<number, BendPoint> = {};
+          Object.keys(bends).forEach((k) => {
+            const idx = parseInt(k, 10);
+            if (idx < hitIdx - 1) newBends[idx] = bends[idx];
+            else if (idx > hitIdx) newBends[idx - 1] = bends[idx];
+          });
+          bends = newBends;
+          deleted = true;
+        }
+      }
+
       if (!deleted && (activeTool === 'SPEED' || activeTool === 'ZOOM' || activeTool === 'OFFSET')) {
         const hit = getClosestPointOnPath(pathBgEl, nodes, bends, coords.x, coords.y);
         const threshold = Math.max(40, 32 / zoom);
@@ -762,6 +823,37 @@
       }
 
       if (activeTool === 'NOTES') {
+        // If clicking an existing note/decoration, drag to move it.
+        let hitNote = -1;
+        for (let i = notes.length - 1; i >= 0; i--) {
+          const n = notes[i];
+          if (coords.x >= n.x && coords.x <= n.x + n.w && coords.y >= n.y && coords.y <= n.y + n.h) {
+            hitNote = i;
+            break;
+          }
+        }
+        let hitDeco = -1;
+        if (hitNote < 0) {
+          for (let i = decorations.length - 1; i >= 0; i--) {
+            const d = decorations[i];
+            if (coords.x >= d.x && coords.x <= d.x + d.w && coords.y >= d.y && coords.y <= d.y + d.h) {
+              hitDeco = i;
+              break;
+            }
+          }
+        }
+        if (hitNote >= 0) {
+          dragStateBackup = captureState();
+          noteDragOffset = { dx: coords.x - notes[hitNote].x, dy: coords.y - notes[hitNote].y };
+          dragTarget = { type: 'note', index: hitNote, isDeco: false };
+          return;
+        }
+        if (hitDeco >= 0) {
+          dragStateBackup = captureState();
+          noteDragOffset = { dx: coords.x - decorations[hitDeco].x, dy: coords.y - decorations[hitDeco].y };
+          dragTarget = { type: 'note', index: hitDeco, isDeco: true };
+          return;
+        }
         drawingNote = { sx: coords.x, sy: coords.y, cx: coords.x, cy: coords.y };
         return;
       }
@@ -1031,8 +1123,24 @@
     const pad = 48;
     const targetZoom = Math.min((vw - pad * 2) / planeW, (vh - pad * 2) / planeH);
     zoom = Math.max(0.02, Math.min(2, targetZoom));
-    panX = (vw - planeW * zoom) / 2;
-    panY = (vh - planeH * zoom) / 2;
+    panX = (vw - planeW * zoom) / 2 - planeOriginX * zoom;
+    panY = (vh - planeH * zoom) / 2 - planeOriginY * zoom;
+  }
+
+  function addMarker() {
+    // Store the full-precision progress value (no rounding, no dedup) so markers
+    // can be placed anywhere along the line, arbitrarily close together.
+    const p = Math.max(0, Math.min(1, previewProgress));
+    saveHistory(captureState());
+    markers.push(p);
+    markers.sort((a, b) => a - b);
+    markers = [...markers];
+  }
+
+  function clearMarkers() {
+    if (markers.length === 0) return;
+    saveHistory(captureState());
+    markers = [];
   }
 
   function isEditableTarget(target: EventTarget | null): boolean {
@@ -1127,6 +1235,13 @@
       }
     }
 
+    // Enter in preview mode: drop a beat marker at the playhead
+    if (e.key === 'Enter' && activeTool === 'PREVIEW') {
+      e.preventDefault();
+      addMarker();
+      return;
+    }
+
     // Fit whole chart to view
     if (e.key === '0' || e.key.toLowerCase() === 'f') {
       e.preventDefault();
@@ -1188,21 +1303,21 @@
         newH = Math.max(500, planeH + dyPlane);
       }
 
-      if (shiftX !== 0 || shiftY !== 0) {
-        panX += shiftX * zoom;
-        panY += shiftY * zoom;
-        nodes = nodes.map((n) => ({ x: n.x - shiftX, y: n.y - shiftY }));
-        bends = Object.fromEntries(
-          Object.entries(bends).map(([k, b]) => [k, { cx: b.cx - shiftX, cy: b.cy - shiftY }])
-        );
-        notes = notes.map((n) => ({ ...n, x: n.x - shiftX, y: n.y - shiftY }));
-      }
+      // Move the plane origin (instead of panning the viewport) so that objects
+      // stay visually fixed at their world coordinates while the dragged edge
+      // follows the mouse. Resizing the top/left simply extends the plane outward.
+      planeOriginX += shiftX;
+      planeOriginY += shiftY;
 
       planeW = newW;
       planeH = newH;
       // Pin the first/last nodes to the plane's left/right edges.
       nodes = nodes.map((n, i) =>
-        i === 0 ? { ...n, x: 0 } : i === nodes.length - 1 ? { ...n, x: planeW } : n
+        i === 0
+          ? { ...n, x: planeOriginX }
+          : i === nodes.length - 1
+            ? { ...n, x: planeOriginX + planeW }
+            : n
       );
     } else if (drawingNote) {
       drawingNote = { ...drawingNote, cx: coords.x, cy: coords.y };
@@ -1238,6 +1353,15 @@
       } else if (dragTarget.type === 'bend') {
         const idx = dragTarget.index;
         bends = { ...bends, [idx]: { cx: coords.x, cy: coords.y } };
+      } else if (dragTarget.type === 'note') {
+        const idx = dragTarget.index;
+        const nx = coords.x - noteDragOffset.dx;
+        const ny = coords.y - noteDragOffset.dy;
+        if (dragTarget.isDeco) {
+          decorations = decorations.map((d, i) => (i === idx ? { ...d, x: nx, y: ny } : d));
+        } else {
+          notes = notes.map((n, i) => (i === idx ? { ...n, x: nx, y: ny } : n));
+        }
       }
     }
 
@@ -1427,9 +1551,9 @@
     const offNx = clamp(off.nx, -1, 1);
     const offNy = clamp(off.ny, -1, 1);
 
-    // 320x180 base PiP size
-    const w = 320;
-    const h = 180;
+    // Base PiP size (keep in sync with the panel width in the template).
+    const w = 440;
+    const h = (w * 9) / 16;
     const viewportScale = w / 1280;
     const finalZoom = z * viewportScale;
 
@@ -1454,6 +1578,35 @@
     // Schedule smooth seeking without freezing SVG transform or slider UI
     if (isScrubbing || !isPipPlaying) {
       scheduleMediaSeek(currentPreviewSec);
+    }
+  }
+
+  function startPipDrag(e: PointerEvent) {
+    const panel = pipPanelEl;
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    pipPos = { x: rect.left, y: rect.top, anchoredBottom: false };
+    pipDragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    isDraggingPip = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function movePipDrag(e: PointerEvent) {
+    if (!isDraggingPip) return;
+    pipPos = {
+      x: clamp(e.clientX - pipDragOffset.x, -320, window.innerWidth - 80),
+      y: clamp(e.clientY - pipDragOffset.y, 0, window.innerHeight - 48),
+      anchoredBottom: false,
+    };
+  }
+
+  function endPipDrag(e: PointerEvent) {
+    if (!isDraggingPip) return;
+    isDraggingPip = false;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
     }
   }
 
@@ -1787,6 +1940,8 @@
 
   function launchPlayGame() {
     commitActiveChart();
+    // In preview mode, start the game at the current playhead position.
+    const startTimeSec = activeTool === 'PREVIEW' ? previewElapsedSec : 0;
     const songData: SongData = {
       id: songId,
       name: songName,
@@ -1801,7 +1956,7 @@
     };
 
     if (onPlaySongLevel && songLevels[activeLevelIndex]) {
-      onPlaySongLevel(songData, songLevels[activeLevelIndex]);
+      onPlaySongLevel(songData, songLevels[activeLevelIndex], startTimeSec);
     } else {
       onPlayGame?.(
         {
@@ -1812,6 +1967,9 @@
           offsetBPs,
           notes,
           decorations,
+          markers,
+          planeOriginX,
+          planeOriginY,
           planeW,
           planeH,
         },
@@ -1833,8 +1991,8 @@
       });
       viewportRO.observe(viewportEl);
 
-      panX = (viewportEl.clientWidth - planeW * zoom) / 2;
-      panY = (viewportEl.clientHeight - planeH * zoom) / 2;
+      panX = (viewportEl.clientWidth - planeW * zoom) / 2 - planeOriginX * zoom;
+      panY = (viewportEl.clientHeight - planeH * zoom) / 2 - planeOriginY * zoom;
     }
     syncPathMetrics();
   });
@@ -2047,7 +2205,7 @@
         class="paper-btn px-3.5 py-1.5 bg-[#292524] hover:bg-[#3f3a39] text-white font-mono font-bold text-xs tracking-wider flex items-center gap-1.5 shadow-[3px_3px_0px_#292524] cursor-pointer"
       >
         <span>▶</span>
-        <span>ゲームでテスト</span>
+        <span>{activeTool === 'PREVIEW' ? 'ここから試す' : 'ゲームでテスト'}</span>
       </button>
     </div>
   </div>
@@ -2059,12 +2217,13 @@
       width: {planeW}px;
       height: {planeH}px;
       transform-origin: 0 0;
-      transform: translate({panX}px, {panY}px) scale({zoom});
+      transform: translate({panX + planeOriginX * zoom}px, {panY + planeOriginY * zoom}px) scale({zoom});
     "
   >
     <svg class="w-full h-full absolute top-0 left-0 overflow-visible">
+      <g transform="translate({-planeOriginX}, {-planeOriginY})">
       <!-- Uniform Grid Layer -->
-      <g id="grid-layer" opacity="0.25" pointer-events="none">
+      <g id="grid-layer" opacity="0.25" pointer-events="none" transform="translate({planeOriginX}, {planeOriginY})">
         <path
           d={gridData.pathD}
           stroke="#cbd5e1"
@@ -2216,6 +2375,18 @@
         stroke-width="1.6"
         stroke-linecap="round"
       />
+
+      <!-- Beat Markers (red dots placed via Enter in preview mode) -->
+      <g id="beat-markers-layer" pointer-events="none">
+        {#each markers as m, i (i)}
+          {@const pt = pathBgEl && totalLength > 0
+            ? pathBgEl.getPointAtLength(m * totalLength)
+            : null}
+          {#if pt}
+            <circle cx={pt.x} cy={pt.y} r="5" fill="#ef4444" stroke="#7f1d1d" stroke-width="1.5" />
+          {/if}
+        {/each}
+      </g>
 
       <!-- Interactive Breakpoint Markers -->
       <g id="markers-layer">
@@ -2556,6 +2727,7 @@
           </text>
         </g>
       {/if}
+      </g>
     </svg>
   </div>
 
@@ -2563,28 +2735,40 @@
   <div
     class="resize-handle absolute z-30 bg-white border-[1.5px] border-[#292524] shadow-[2px_2px_0px_#292524] w-4 h-4 cursor-nwse-resize -translate-x-1/2 -translate-y-1/2"
     data-corner="tl"
-    style="left: {panX}px; top: {panY}px;"
+    style="left: {panX + planeOriginX * zoom}px; top: {panY + planeOriginY * zoom}px;"
   ></div>
   <div
     class="resize-handle absolute z-30 bg-white border-[1.5px] border-[#292524] shadow-[2px_2px_0px_#292524] w-4 h-4 cursor-nesw-resize -translate-x-1/2 -translate-y-1/2"
     data-corner="tr"
-    style="left: {panX + planeW * zoom}px; top: {panY}px;"
+    style="left: {panX + (planeOriginX + planeW) * zoom}px; top: {panY + planeOriginY * zoom}px;"
   ></div>
   <div
     class="resize-handle absolute z-30 bg-white border-[1.5px] border-[#292524] shadow-[2px_2px_0px_#292524] w-4 h-4 cursor-nesw-resize -translate-x-1/2 -translate-y-1/2"
     data-corner="bl"
-    style="left: {panX}px; top: {panY + planeH * zoom}px;"
+    style="left: {panX + planeOriginX * zoom}px; top: {panY + (planeOriginY + planeH) * zoom}px;"
   ></div>
   <div
     class="resize-handle absolute z-30 bg-white border-[1.5px] border-[#292524] shadow-[2px_2px_0px_#292524] w-4 h-4 cursor-nwse-resize -translate-x-1/2 -translate-y-1/2"
     data-corner="br"
-    style="left: {panX + planeW * zoom}px; top: {panY + planeH * zoom}px;"
+    style="left: {panX + (planeOriginX + planeW) * zoom}px; top: {panY + (planeOriginY + planeH) * zoom}px;"
   ></div>
 
   <!-- Picture-in-Picture (PiP) Window -->
   {#if activeTool === 'PREVIEW'}
-    <div class="notebook-panel fixed bottom-24 left-6 w-80 p-3 bg-[#fffdfa] border-[1.5px] border-[#292524] shadow-[4px_4px_0px_#292524] z-50 pointer-events-auto">
-      <div class="flex items-center justify-between pb-1.5 mb-2 border-b border-[#292524]/20 text-xs font-mono font-bold">
+    <div
+      bind:this={pipPanelEl}
+      class="notebook-panel fixed z-50 pointer-events-auto w-[440px] p-3 bg-[#fffdfa] border-[1.5px] border-[#292524] shadow-[4px_4px_0px_#292524]"
+      style={pipPanelStyle}
+    >
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="flex items-center justify-between pb-1.5 mb-2 border-b border-[#292524]/20 text-xs font-mono font-bold {isDraggingPip ? 'cursor-grabbing' : 'cursor-grab'}"
+        title="ドラッグで移動"
+        onpointerdown={startPipDrag}
+        onpointermove={movePipDrag}
+        onpointerup={endPipDrag}
+        onpointercancel={endPipDrag}
+      >
         <span class="flex items-center gap-1.5">
           <span>カメラPOVプレビュー</span>
           {#if resolvedAudioUrl}
@@ -2628,7 +2812,7 @@
         >
           <svg style="width: {planeW}px; height: {planeH}px;" class="overflow-visible pointer-events-none">
             <!-- Uniform Grid in PiP -->
-            <g id="pip-grid" opacity="0.25">
+            <g id="pip-grid" opacity="0.25" transform="translate({planeOriginX}, {planeOriginY})">
               <path
                 d={gridData.pathD}
                 stroke="#cbd5e1"
@@ -3101,6 +3285,15 @@
         🎵 {isDetectingBpm ? '解析中...' : bpm ? `${bpm.toFixed(1)} BPM` : 'BPM解析'}
       </button>
 
+      <button
+        onclick={clearMarkers}
+        disabled={markers.length === 0}
+        class="paper-btn px-3 py-1.5 bg-[#fce1db] hover:bg-[#f9c5bd] text-[#be123c] font-mono font-bold text-xs {markers.length === 0 ? 'opacity-40 cursor-not-allowed' : ''}"
+        title="ビートマーカーを全て消去"
+      >
+        🧹 マーカー消去 {#if markers.length > 0}({markers.length}){/if}
+      </button>
+
       <div class="w-px h-6 bg-[#292524]/20 mx-1"></div>
 
       <!-- Tool Buttons -->
@@ -3227,7 +3420,7 @@
         onclick={launchPlayGame}
         class="paper-btn px-4 py-1.5 bg-[#292524] hover:bg-[#3f3a39] text-white font-mono font-bold text-xs cursor-pointer shadow-[2px_2px_0px_#292524]"
       >
-        ▶ ゲームをプレイ
+        {activeTool === 'PREVIEW' ? '▶ ここから試す' : '▶ ゲームをプレイ'}
       </button>
     </div>
 

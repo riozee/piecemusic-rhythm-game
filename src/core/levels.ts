@@ -15,6 +15,9 @@ export function createDefaultTrack(): TrackData {
     offsetBPs: [],
     notes: [],
     decorations: [],
+    markers: [],
+    planeOriginX: 0,
+    planeOriginY: 0,
     planeW: 2000,
     planeH: 1000,
   };
@@ -53,6 +56,9 @@ export async function loadTrackData(level: Level): Promise<TrackData> {
           offsetBPs: data.offsetBPs || [],
           notes: data.notes || [],
           decorations: data.decorations || [],
+          markers: data.markers || [],
+          planeOriginX: data.planeOriginX || 0,
+          planeOriginY: data.planeOriginY || 0,
           planeW: data.planeW || 2000,
           planeH: data.planeH || 1000,
         };
