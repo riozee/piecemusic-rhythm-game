@@ -1,3 +1,7 @@
+# Level data (large media files)
+public/levels/gyakuten1/
+public/levels/gyakuten2/
+
 # Logs
 logs
 *.log
