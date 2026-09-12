@@ -375,7 +375,7 @@
                     "
                   >
                     <span class="text-2xl sm:text-4xl font-black font-mono text-[#292524] tracking-tight">{lane.label}</span>
-                    <span class="text-[10px] sm:text-xs font-mono text-[#292524]/60 uppercase tracking-widest mt-2">長押しでヒット</span>
+                    <span class="text-[10px] sm:text-xs font-mono text-[#292524]/60 uppercase tracking-widest mt-2">ヒット</span>
                   </button>
                 {/each}
               </div>
