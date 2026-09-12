@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   interface Props {
     levelName: string;
     score: number;
@@ -29,6 +31,52 @@
     if (accuracy >= 60) return { rank: 'B', label: 'グッド', bg: '#dbe9f4', border: '#2563eb' };
     return { rank: 'C', label: 'クリア', bg: '#fce1db', border: '#e11d48' };
   });
+
+  // --- Auto-restart after 15 seconds of inactivity ---
+  const AUTO_RESTART_MS = 15_000;
+  let autoRestartRemaining = $state(AUTO_RESTART_MS);
+  let autoRestartRafId: number | null = null;
+  let autoRestartDeadline = $state(0);
+
+  function resetAutoRestart() {
+    autoRestartDeadline = performance.now() + AUTO_RESTART_MS;
+    autoRestartRemaining = AUTO_RESTART_MS;
+  }
+
+  function tickAutoRestart() {
+    const now = performance.now();
+    const left = autoRestartDeadline - now;
+    autoRestartRemaining = Math.max(0, left);
+    if (left <= 0) {
+      onPlayAgain();
+      return;
+    }
+    autoRestartRafId = requestAnimationFrame(tickAutoRestart);
+  }
+
+  function cleanupAutoRestart() {
+    if (autoRestartRafId != null) { cancelAnimationFrame(autoRestartRafId); autoRestartRafId = null; }
+  }
+
+  function handleActivity() {
+    resetAutoRestart();
+  }
+
+  onMount(() => {
+    resetAutoRestart();
+    autoRestartRafId = requestAnimationFrame(tickAutoRestart);
+
+    const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'pointerdown'] as const;
+    for (const evt of events) window.addEventListener(evt, handleActivity, { passive: true });
+
+    return () => {
+      cleanupAutoRestart();
+      for (const evt of events) window.removeEventListener(evt, handleActivity);
+    };
+  });
+
+  const autoRestartSec = $derived(Math.ceil(autoRestartRemaining / 1000));
+  const autoRestartProgress = $derived(autoRestartRemaining / AUTO_RESTART_MS * 100);
 </script>
 
 <div
@@ -114,6 +162,20 @@
         </div>
         <span class="text-[11px] text-[#292524]/60 font-mono">トラック一覧 →</span>
       </button>
+    </div>
+
+    <!-- Auto-Restart Countdown -->
+    <div class="mt-4 w-full">
+      <div class="flex justify-between text-[10px] font-mono text-[#292524]/60 mb-1">
+        <span>自動リスタート</span>
+        <span>{autoRestartSec}秒</span>
+      </div>
+      <div class="w-full h-1.5 bg-neutral-200 border border-[#292524]/20 overflow-hidden">
+        <div
+          class="h-full bg-[#81c784] transition-[width] duration-100"
+          style="width: {autoRestartProgress}%"
+        ></div>
+      </div>
     </div>
   </div>
 </div>
