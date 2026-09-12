@@ -128,7 +128,15 @@ function getLanIp(): string | null {
 
 function levelsPlugin(): Plugin {
   const sendSongs = (_req: any, res: any) => {
-    const songs = getSongMetadata(path.resolve(__dirname, "public"));
+    let songs = getSongMetadata(path.resolve(__dirname, "public"));
+    if (songs.length === 0) {
+      const jsonPath = path.resolve(__dirname, "public", "levels", "levels.json");
+      if (fs.existsSync(jsonPath)) {
+        try {
+          songs = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+        } catch {}
+      }
+    }
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify(songs));
   };
@@ -159,8 +167,10 @@ function levelsPlugin(): Plugin {
     buildStart() {
       const publicDir = path.resolve(__dirname, "public");
       const songs = getSongMetadata(publicDir);
-      const jsonPath = path.resolve(publicDir, "levels/levels.json");
-      fs.writeFileSync(jsonPath, JSON.stringify(songs, null, 2));
+      if (songs.length > 0) {
+        const jsonPath = path.resolve(publicDir, "levels/levels.json");
+        fs.writeFileSync(jsonPath, JSON.stringify(songs, null, 2));
+      }
     },
     closeBundle() {
       // Song archives are served from Cloudflare R2, not static assets
