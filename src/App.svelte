@@ -239,18 +239,23 @@
           console.log('[WebRTC] Controller phone disconnected:', peerId);
           connectedPeersCount = webrtcHost?.getConnectedPeerCount() || 0;
         },
-        onKeyMessage: (event: ControllerKeyEvent) => {
+        onKeyMessage: (event: ControllerKeyEvent, peerId: string) => {
           lastReceivedKey = `${event.key} [${event.action.toUpperCase()}]`;
 
           // Process key event in rhythm game when in playing mode.
           // Latency compensation: map the phone's press timestamp into host audio
           // time so the note is judged at the moment it was pressed — not when the
-          // WebRTC packet happened to arrive.
+          // WebRTC packet happened to arrive. Each phone has its own clock offset.
           if (currentScreen === 'playing' && event.action === 'down' && !isGameFinished) {
-            const offsetMs = webrtcHost?.getClockOffsetMs() ?? 0;
-            const hostPerfNow = event.timestamp - offsetMs;
-            const pressAudioTime = syncEngine.hostClockToAudioTime(hostPerfNow);
-            rhythmCanvas?.handleRhythmInput(event.key, pressAudioTime);
+            const offsetMs = webrtcHost?.getClockOffsetMs(peerId) ?? null;
+            if (offsetMs !== null) {
+              const hostPerfNow = event.timestamp - offsetMs;
+              const pressAudioTime = syncEngine.hostClockToAudioTime(hostPerfNow);
+              rhythmCanvas?.handleRhythmInput(event.key, pressAudioTime);
+            } else {
+              // No clock sample for this phone yet — judge at live playhead time.
+              rhythmCanvas?.handleRhythmInput(event.key);
+            }
           }
         },
         onCommandMessage: (event) => {

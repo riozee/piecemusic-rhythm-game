@@ -19,6 +19,9 @@
   let statusMessage = $state('初期化中...');
   let client: WebRtcClient | null = null;
   let viewportManager: ViewportManager | null = null;
+  // The desktop host is the only peer that sends `state`; we remember its id so
+  // we can ignore join/leave events from other phones in the same room.
+  let hostPeerId: string | null = null;
 
   let remoteState = $state<ControllerState>({
     screen: 'home',
@@ -56,21 +59,34 @@
       client.stop();
     }
 
+    hostPeerId = null;
     isConnecting = true;
     isConnected = false;
     statusMessage = '公開ビーコン経由で接続中...';
 
     client = new WebRtcClient(cleanId, {
       onPeerJoin: (peerId: string) => {
+        // Phones mesh with each other in the same room, so once the host is
+        // known, ignore join events from any other peer.
+        if (hostPeerId !== null && peerId !== hostPeerId) return;
         isConnected = true;
         isConnecting = false;
         statusMessage = `デスクトップに接続済み (${peerId.slice(0, 5)})`;
       },
-      onPeerLeave: () => {
+      onPeerLeave: (peerId: string) => {
+        // Only the desktop host matters; another phone leaving the mesh should
+        // not mark this controller as disconnected.
+        if (hostPeerId !== null && peerId !== hostPeerId) return;
+        hostPeerId = null;
         isConnected = false;
         statusMessage = 'デスクトップ切断';
       },
-      onStateMessage: (state) => {
+      onStateMessage: (state, peerId) => {
+        // The desktop host is the only peer that sends state; remember it so
+        // other phones can be distinguished from the host.
+        hostPeerId = peerId;
+        isConnected = true;
+        isConnecting = false;
         remoteState = state;
       },
     });

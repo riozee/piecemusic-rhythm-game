@@ -70,8 +70,10 @@ export class WebRtcHost {
   private stateAction: any = null;
   private pingAction: any = null;
   private pongAction: any = null;
-  private clockOffsetMs = 0;
-  private clockOffsetSamples = 0;
+  private clockOffsets = new Map<
+    string,
+    { offsetMs: number; samples: number }
+  >();
   private syncTimer: number | null = null;
   public readonly selfPeerId = selfId;
 
@@ -121,17 +123,24 @@ export class WebRtcHost {
     // own. Used to judge note hits at press-time rather than packet-arrival time.
     this.pingAction = this.room.makeAction<ClockPingEvent>("ping");
     this.pongAction = this.room.makeAction<ClockPongEvent>("pong");
-    this.pongAction.onMessage = (data: ClockPongEvent) => {
+    this.pongAction.onMessage = (
+      data: ClockPongEvent,
+      context: { peerId: string },
+    ) => {
       const now = performance.now();
       const rtt = now - data.pingT;
       if (rtt < 0 || rtt > 2000) return; // ignore stale/malformed pongs
       const sample = data.phoneT - (data.pingT + rtt / 2); // phoneClock - hostClock
-      if (this.clockOffsetSamples === 0) {
-        this.clockOffsetMs = sample;
-      } else {
-        this.clockOffsetMs = this.clockOffsetMs * 0.7 + sample * 0.3;
-      }
-      this.clockOffsetSamples++;
+      // Track a separate clock offset per phone so multiple controllers with
+      // different network latencies can all be judged accurately.
+      const entry = this.clockOffsets.get(context.peerId) ?? {
+        offsetMs: 0,
+        samples: 0,
+      };
+      entry.offsetMs =
+        entry.samples === 0 ? sample : entry.offsetMs * 0.7 + sample * 0.3;
+      entry.samples++;
+      this.clockOffsets.set(context.peerId, entry);
     };
     this.startClockSync();
 
@@ -162,9 +171,26 @@ export class WebRtcHost {
   /**
    * Estimated offset (ms) to subtract from a phone performance.now() timestamp
    * to convert it into host-clock time: hostClock = phoneClock - offset.
+   * Returns `null` until at least one ping/pong sample has been collected for
+   * the given peer (or for any peer when no id is supplied).
    */
-  public getClockOffsetMs(): number {
-    return this.clockOffsetMs;
+  public getClockOffsetMs(peerId?: string): number | null {
+    if (peerId !== undefined) {
+      const entry = this.clockOffsets.get(peerId);
+      return entry && entry.samples > 0 ? entry.offsetMs : null;
+    }
+    const entries = Array.from(this.clockOffsets.values()).filter(
+      (entry) => entry.samples > 0,
+    );
+    if (entries.length === 0) return null;
+    return (
+      entries.reduce((sum, entry) => sum + entry.offsetMs, 0) / entries.length
+    );
+  }
+
+  public getConnectedPeerIds(): string[] {
+    if (!this.room) return [];
+    return Object.keys(this.room.getPeers());
   }
 
   public sendState(state: ControllerState): void {
@@ -179,8 +205,7 @@ export class WebRtcHost {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
     }
-    this.clockOffsetMs = 0;
-    this.clockOffsetSamples = 0;
+    this.clockOffsets.clear();
 
     if (this.room) {
       try {
